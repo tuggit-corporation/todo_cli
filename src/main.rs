@@ -1,4 +1,5 @@
 mod clickup;
+mod github;
 mod store;
 mod tui;
 mod update;
@@ -15,7 +16,7 @@ use store::{Priority, Scope, Status, Store, TaskEdit};
     name = "todo",
     version,
     about = "Local-first tasks and projects with a vim-style terminal UI",
-    after_help = "Run without a command to open the TUI.\nAI/automation: use --json with task/project commands. No server is required.\nUse --database PATH for separate workspaces. Shared lists and authentication are not implemented yet."
+    after_help = "Run without a command to open the TUI.\nAI/automation: use --json with task/project commands. No server is required.\nUse --database PATH for separate workspaces. Shared-list hosting is not implemented."
 )]
 struct Cli {
     /// SQLite database path (default: your platform's local data directory)
@@ -67,10 +68,18 @@ enum Command {
         #[command(subcommand)]
         command: clickup::Command,
     },
+    /// Authenticate with gh and sync assigned GitHub issues
+    Github {
+        #[command(subcommand)]
+        command: github::Command,
+    },
 }
 
 #[derive(Args)]
 struct Filter {
+    /// Only imported tasks assigned to your connected ClickUp/GitHub account
+    #[arg(long)]
+    assigned_to_me: bool,
     /// Only tasks belonging to this project ID
     #[arg(long, conflicts_with = "personal")]
     project: Option<i64>,
@@ -245,6 +254,7 @@ fn run(cli: Cli) -> Result<()> {
     let json = cli.json;
     match cli.command.unwrap_or(Command::Tui) {
         Command::Clickup { command } => clickup::run(command, &paths.database, json),
+        Command::Github { command } => github::run(command, &paths.database, json),
         Command::Paths => output(json, &paths, || {
             println!(
                 "Database: {}\nConfig:   {}",
@@ -291,7 +301,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut store = Store::open(&paths.database)?;
             match command {
                 ProjectCommand::List => {
-                    let projects = store.projects()?;
+                    let projects = store.visible_projects()?;
                     output(json, &projects, || {
                         for project in &projects {
                             println!("{:>4}  {}", project.id, safe(&project.name));
@@ -330,7 +340,10 @@ fn run(cli: Cli) -> Result<()> {
             );
             let task = match command {
                 TaskCommand::List { filter } => {
-                    let tasks = store.tasks(filter.scope(), filter.status, &filter.search)?;
+                    let mut tasks = store.tasks(filter.scope(), filter.status, &filter.search)?;
+                    if filter.assigned_to_me {
+                        store.assigned_to_me(&mut tasks)?;
+                    }
                     return output(json, &tasks, || {
                         for task in &tasks {
                             print_task(task);
@@ -448,6 +461,16 @@ fn run(cli: Cli) -> Result<()> {
                     Err(error) => eprintln!(
                         "Saved locally; ClickUp will retry while the TUI is open: {error:#}"
                     ),
+                }
+            }
+            if mutates && task.github_url.is_some() && github::enabled(&store)? {
+                match github::sync(&paths.database, false) {
+                    Ok(report) => {
+                        for issue in report.issues {
+                            eprintln!("GitHub: {}", safe(&issue));
+                        }
+                    }
+                    Err(error) => eprintln!("Saved locally; GitHub sync pending: {error:#}"),
                 }
             }
             let task = store.task(task.id)?;

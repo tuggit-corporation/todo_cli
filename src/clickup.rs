@@ -64,15 +64,28 @@ pub enum Command {
     },
     /// Show assignable List members for a linked project
     Members { project: i64 },
+    /// Clear a project's local ClickUp cache after backing up; next sync reimports it
+    Reset {
+        project: i64,
+        /// Discard local tasks/edits in this project (never deletes in ClickUp)
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
     /// Sync one linked project in both directions (never deletes tasks)
     Sync {
         project: i64,
         /// Resolve only this conflicting task using local values
-        #[arg(long, conflicts_with = "prefer_remote")]
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..), conflicts_with_all = ["prefer_remote", "prefer_local_all", "prefer_remote_all"])]
         prefer_local: Option<i64>,
         /// Resolve only this conflicting task using ClickUp values
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..), conflicts_with_all = ["prefer_local_all", "prefer_remote_all"])]
         prefer_remote: Option<i64>,
+        /// Overwrite supported ClickUp fields for every conflicting task in this project
+        #[arg(long, conflicts_with = "prefer_remote_all")]
+        prefer_local_all: bool,
+        /// Discard conflicting local edits for every mapped task in this project
+        #[arg(long)]
+        prefer_remote_all: bool,
     },
     /// Recover a create whose result was uncertain; inspect ClickUp first, then supply its task ID
     Recover { task: i64, remote_id: String },
@@ -101,7 +114,7 @@ fn string_id<'de, D: serde::Deserializer<'de>>(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct DiscoveredList {
     id: String,
     name: String,
@@ -266,6 +279,8 @@ fn choose_status(
 }
 
 fn import_link(store: &Store, api: &Api, list: &DiscoveredList, timezone: Tz) -> Result<Link> {
+    remember_source(store, list)?;
+    select_source(store, &list.id, true)?;
     if let Some(link) = links(store)?.into_iter().find(|l| l.list_id == list.id) {
         store_location(store, list)?;
         eprintln!(
@@ -1047,7 +1062,7 @@ fn sync(store: &Store, api: &Api, link: &Link, resolve: Option<(i64, Choice)>) -
     let mut report = Report::default();
     let known = mappings(store, link.project_id)?;
     let has_pending = known.iter().any(|m| m.pending);
-    if let Some((id, _)) = resolve {
+    if let Some((id, _)) = resolve.filter(|(id, _)| *id != 0) {
         if !known
             .iter()
             .any(|m| m.local_id == Some(id) && m.remote_id.is_some())
@@ -1061,7 +1076,8 @@ fn sync(store: &Store, api: &Api, link: &Link, resolve: Option<(i64, Choice)>) -
     // Tombstones remain mapped: deleting locally must not resurrect tasks on pull.
     let seen_remote: HashSet<String> = known.iter().filter_map(|m| m.remote_id.clone()).collect();
     for mapping in known {
-        if !mapping.pending && resolve.is_none_or(|(id, _)| mapping.local_id != Some(id)) {
+        if !mapping.pending && resolve.is_none_or(|(id, _)| id != 0 && mapping.local_id != Some(id))
+        {
             if let (Some(id), Some(remote_id), Some(old_local), Some(old_remote)) = (
                 mapping.local_id,
                 &mapping.remote_id,
@@ -1136,6 +1152,9 @@ fn sync(store: &Store, api: &Api, link: &Link, resolve: Option<(i64, Choice)>) -
         .filter_map(|m| m.local_id)
         .collect();
     for task in store.tasks(Scope::Project(link.project_id), Status::All, "")? {
+        if task.github_url.is_some() || task.github_project_url.is_some() {
+            continue;
+        }
         if mapped.contains(&task.id) {
             continue;
         }
@@ -1158,6 +1177,17 @@ fn sync(store: &Store, api: &Api, link: &Link, resolve: Option<(i64, Choice)>) -
         }
     }
     Ok(report)
+}
+
+fn remember_profile(store: &Store, profile: &Value) -> Result<()> {
+    let id = profile["user"]["id"]
+        .as_i64()
+        .or_else(|| profile["user"]["id"].as_str()?.parse().ok())
+        .context("ClickUp profile is missing the account ID")?;
+    store
+        .conn
+        .execute("UPDATE clickup_preferences SET user_id=?1 WHERE id=1", [id])?;
+    Ok(())
 }
 
 fn refresh_members(store: &Store, api: &Api, link: &Link) -> Result<Vec<Assignee>> {
@@ -1260,9 +1290,83 @@ pub fn auto_enabled(store: &Store) -> Result<bool> {
     )?)
 }
 
+pub fn sources(store: &Store) -> Result<Vec<crate::github::sources::Source>> {
+    let mut stmt = store.conn.prepare(
+        "SELECT list_id,label,enabled FROM clickup_sources ORDER BY label COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(crate::github::sources::Source {
+            kind: "clickup".into(),
+            remote_id: r.get(0)?,
+            label: r.get(1)?,
+            enabled: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn select_source(store: &Store, id: &str, enabled: bool) -> Result<()> {
+    atomic(store, || {
+        if store.conn.execute(
+            "UPDATE clickup_sources SET enabled=?1 WHERE list_id=?2",
+            params![enabled, id],
+        )? == 0
+        {
+            bail!("Unknown ClickUp List; refresh sources first");
+        }
+        if enabled {
+            store
+                .conn
+                .execute("UPDATE clickup_preferences SET enabled=1", [])?;
+        }
+        Ok(())
+    })
+}
+
+fn refresh_sources(store: &Store, api: &Api) -> Result<AutoReport> {
+    let discovery = discover(api)?;
+    for list in discovery.lists {
+        remember_source(store, &list)?;
+        store_location(store, &list)?;
+    }
+    Ok(AutoReport {
+        issues: discovery.warnings,
+        ..Default::default()
+    })
+}
+
+fn remember_source(store: &Store, list: &DiscoveredList) -> Result<()> {
+    let label = [&list.workspace, &list.space]
+        .into_iter()
+        .map(String::as_str)
+        .chain(list.folder.as_deref())
+        .chain(std::iter::once(list.name.as_str()))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    store.conn.execute(
+        "INSERT INTO clickup_sources(list_id,label,location) VALUES(?1,?2,?3)
+             ON CONFLICT(list_id) DO UPDATE SET label=excluded.label,location=excluded.location",
+        params![list.id, label, serde_json::to_string(&list)?],
+    )?;
+    Ok(())
+}
+
+fn selected_links(store: &Store) -> Result<Vec<Link>> {
+    let disabled: HashSet<_> = sources(store)?
+        .into_iter()
+        .filter(|s| !s.enabled)
+        .map(|s| s.remote_id)
+        .collect();
+    Ok(links(store)?
+        .into_iter()
+        .filter(|l| !disabled.contains(&l.list_id))
+        .collect())
+}
+
 fn push_pending(store: &Store, api: &Api) -> Result<AutoReport> {
     let mut result = AutoReport::default();
-    let links = links(store)?;
+    let links = selected_links(store)?;
     result.projects = links.len();
     let known: HashMap<_, _> = links
         .iter()
@@ -1271,6 +1375,9 @@ fn push_pending(store: &Store, api: &Api) -> Result<AutoReport> {
     let mut tasks = store.tasks(Scope::All, Status::All, "")?;
     tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     for task in tasks {
+        if task.github_url.is_some() || task.github_project_url.is_some() {
+            continue;
+        }
         let Some(link) = links.iter().find(|l| Some(l.project_id) == task.project_id) else {
             continue;
         };
@@ -1318,13 +1425,12 @@ fn auto_cycle_with_api(store: &Store, api: &Api, discover_new: bool) -> Result<A
         return Ok(result);
     }
     result.projects = 0;
-    let all_lists: bool = store.conn.query_row(
-        "SELECT all_lists FROM clickup_preferences WHERE id=1",
-        [],
-        |r| r.get(0),
-    )?;
-    if discover_new && all_lists {
-        let profile = api.get("/user")?;
+    if selected_links(store)?.is_empty() && !sources(store)?.iter().any(|s| s.enabled) {
+        return Ok(result);
+    }
+    let profile = api.get("/user")?;
+    remember_profile(store, &profile)?;
+    if discover_new {
         let configured: Option<String> = store.conn.query_row(
             "SELECT timezone FROM clickup_preferences WHERE id=1",
             [],
@@ -1342,9 +1448,14 @@ fn auto_cycle_with_api(store: &Store, api: &Api, discover_new: bool) -> Result<A
             .context(
                 "Set your ClickUp timezone once: todo clickup auto --timezone Europe/Stockholm",
             )?;
-        let discovery = discover(api)?;
-        result.issues.extend(discovery.warnings);
-        for list in discovery.lists {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT location FROM clickup_sources WHERE enabled=1")?;
+        let locations = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for location in locations {
+            let list: DiscoveredList = serde_json::from_str(&location)?;
             if let Err(error) = automatic_link(store, api, &list, timezone) {
                 result
                     .issues
@@ -1352,7 +1463,7 @@ fn auto_cycle_with_api(store: &Store, api: &Api, discover_new: bool) -> Result<A
             }
         }
     }
-    for link in links(store)? {
+    for link in selected_links(store)? {
         result.projects += 1;
         match sync(store, api, &link, None) {
             Ok(report) => {
@@ -1377,9 +1488,14 @@ fn auto_cycle(
     discover_new: bool,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    catalog: bool,
 ) -> Result<AutoReport> {
     let store = Store::open(database)?;
-    if !auto_enabled(&store)? {
+    if !catalog && !auto_enabled(&store)? {
+        return Ok(AutoReport::default());
+    }
+    if !catalog && selected_links(&store)?.is_empty() && !sources(&store)?.iter().any(|s| s.enabled)
+    {
         return Ok(AutoReport::default());
     }
     let secret = match token() {
@@ -1398,15 +1514,19 @@ fn auto_cycle(
     let mut api = Api::new(&secret)?;
     api.cancel = cancel;
     api.interrupt = interrupt;
-    auto_cycle_with_api(&store, &api, discover_new)
+    if catalog {
+        refresh_sources(&store, &api)
+    } else {
+        auto_cycle_with_api(&store, &api, discover_new)
+    }
 }
 
 pub fn push_after_edit(database: &Path) -> Result<AutoReport> {
-    auto_cycle(database, false, None, None)
+    auto_cycle(database, false, None, None, false)
 }
 
 pub struct AutoSync {
-    requests: Option<std::sync::mpsc::Sender<bool>>,
+    requests: Option<std::sync::mpsc::Sender<(bool, bool)>>,
     pub results: std::sync::mpsc::Receiver<Result<AutoReport>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1415,7 +1535,7 @@ pub struct AutoSync {
 
 impl AutoSync {
     pub fn start(database: &Path) -> Self {
-        let (requests, receive) = std::sync::mpsc::channel::<bool>();
+        let (requests, receive) = std::sync::mpsc::channel::<(bool, bool)>();
         let (send, results) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = cancel.clone();
@@ -1423,11 +1543,12 @@ impl AutoSync {
         let pause = interrupt.clone();
         let path = database.to_path_buf();
         let thread = std::thread::spawn(move || {
-            while let Ok(mut discover) = receive.recv() {
+            while let Ok((mut discover, mut catalog)) = receive.recv() {
                 // Coalesce rapid edits, but never lose a requested discovery pass.
                 std::thread::sleep(Duration::from_millis(200));
                 while let Ok(request) = receive.try_recv() {
-                    discover |= request;
+                    discover |= request.0;
+                    catalog |= request.1;
                 }
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -1438,6 +1559,7 @@ impl AutoSync {
                     discover,
                     Some(stop.clone()),
                     discover.then(|| pause.clone()),
+                    catalog,
                 );
                 if send.send(result).is_err() {
                     break;
@@ -1461,7 +1583,13 @@ impl AutoSync {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(sender) = &self.requests {
-            let _ = sender.send(discovery);
+            let _ = sender.send((discovery, false));
+        }
+    }
+
+    pub fn refresh_sources(&self) {
+        if let Some(sender) = &self.requests {
+            let _ = sender.send((false, true));
         }
     }
 
@@ -1523,7 +1651,7 @@ fn sync_one(
             || remote.start_date != old_remote.start_date
             || remote.start_date_time != old_remote.start_date_time;
         let choice = resolve
-            .filter(|(task, _)| *task == id)
+            .filter(|(task, _)| *task == 0 || *task == id)
             .map(|(_, choice)| choice);
         if local_changed && remote_changed && state != remote.state && choice.is_none() {
             bail!("Conflict: both copies changed. Inspect both, then sync with --prefer-local {id} or --prefer-remote {id}");
@@ -1704,6 +1832,38 @@ fn validate_statuses(metadata: &Value, link: &Link) -> Result<()> {
     Ok(())
 }
 
+fn reset_project(store: &Store, database: &Path, project: i64) -> Result<std::path::PathBuf> {
+    if !links(store)?.iter().any(|link| link.project_id == project) {
+        bail!("Project {project} is not linked to ClickUp");
+    }
+    let backup = tempfile::Builder::new()
+        .prefix("todo-before-clickup-reset-")
+        .suffix(".sqlite3")
+        .tempfile_in(
+            database
+                .canonicalize()?
+                .parent()
+                .context("Database directory missing")?,
+        )?;
+    let path = backup.path().to_path_buf();
+    store.conn.execute(
+        "VACUUM INTO ?1",
+        [path.to_str().context("Backup path is not UTF-8")?],
+    )?;
+    let (_, path) = backup
+        .keep()
+        .context("Cannot retain database backup; reset cancelled")?;
+    atomic(store, || {
+        // Include tasks moved out of this project but still mapped to its List.
+        store.conn.execute("DELETE FROM tasks WHERE project_id=?1 OR id IN (SELECT local_id FROM clickup_tasks WHERE project_id=?1)", [project])?;
+        store
+            .conn
+            .execute("DELETE FROM clickup_tasks WHERE project_id=?1", [project])?;
+        Ok(())
+    })?;
+    Ok(path)
+}
+
 pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
     if matches!(command, Command::Import)
         && (json_output || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal())
@@ -1728,12 +1888,13 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
                 }
             }
             let secret = rpassword::prompt_password("Paste ClickUp API token (hidden): ")?;
-            Api::new(secret.trim())?
+            let profile = Api::new(secret.trim())?
                 .get("/user")
                 .context("Token validation failed; credential was not saved")?;
             credential()?.set_password(secret.trim()).context("Cannot save token to OS credential store; set CLICKUP_API_TOKEN instead (no plaintext fallback)")?;
+            remember_profile(&Store::open(database)?, &profile)?;
             println!("ClickUp token saved to your OS credential store.");
-            println!("Start todo to discover/import accessible Lists automatically. Press C for manual List/status setup.");
+            println!("Open todo, press ? and choose ClickUp sources to select Lists to sync.");
             return Ok(());
         }
         Command::Disconnect => {
@@ -1741,6 +1902,9 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
                 Ok(()) | Err(keyring::Error::NoEntry) => {}
                 Err(error) => return Err(error).context("Cannot remove saved ClickUp credential"),
             }
+            Store::open(database)?
+                .conn
+                .execute("UPDATE clickup_preferences SET user_id=NULL", [])?;
             return crate::output(json_output, &json!({"disconnected":true}), || {
                 println!("Saved token removed. Revoke it in ClickUp settings if needed; CLICKUP_API_TOKEN still takes precedence.")
             });
@@ -1769,9 +1933,9 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
         let enabled = auto_enabled(&store)?;
         return crate::output(
             json_output,
-            &json!({"automatic_sync":enabled,"all_accessible_lists":true}),
+            &json!({"automatic_sync":enabled,"all_accessible_lists":false}),
             || {
-                println!("Automatic ClickUp sync: {}. Discovers all accessible Lists while todo is open.", if enabled { "on" } else { "off" })
+                println!("Automatic ClickUp sync: {}. Only selected Lists sync; manage sources under ? in todo.", if enabled { "on" } else { "off" })
             },
         );
     }
@@ -1795,6 +1959,20 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
         .open(lock_path)?;
     lock.try_lock_exclusive()
         .context("Another ClickUp operation is running for this database")?;
+    if let Command::Reset { project, .. } = command {
+        let backup = reset_project(&store, database, project)?;
+        return crate::output(
+            json_output,
+            &json!({"project":project,"reset":true,"backup":backup}),
+            || {
+                println!(
+                    "Cleared local ClickUp cache for project {project}. Backup: {}",
+                    backup.display()
+                );
+                println!("ClickUp was not changed. Run `todo clickup sync {project}` to reimport.");
+            },
+        );
+    }
     if let Command::RetryCreate {
         task,
         confirm_missing: true,
@@ -1814,6 +1992,7 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
         );
     }
     let api = Api::new(&token()?)?;
+    remember_profile(&store, &api.get("/user")?)?;
     match command {
         Command::Members { project } => {
             let link = links(&store)?
@@ -1895,6 +2074,20 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
             store.conn.execute("INSERT INTO clickup_projects(project_id,list_id,open_status,working_status,done_status,timezone) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![project, link.list_id, link.open_status, link.working_status, link.done_status, timezone.to_string()])
                 .context("Cannot link: project must exist, and each project/List can be linked only once")?;
+            remember_source(
+                &store,
+                &DiscoveredList {
+                    id: link.list_id.clone(),
+                    name: metadata["name"]
+                        .as_str()
+                        .unwrap_or(&link.list_id)
+                        .to_owned(),
+                    workspace: String::new(),
+                    space: String::new(),
+                    folder: None,
+                },
+            )?;
+            select_source(&store, &link.list_id, true)?;
             crate::output(json_output, &link, || {
                 println!("Linked project {project}. `todo clickup sync {project}` will exchange all tasks in this project and List.")
             })
@@ -1903,6 +2096,8 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
             project,
             prefer_local,
             prefer_remote,
+            prefer_local_all,
+            prefer_remote_all,
         } => {
             let link = links(&store)?
                 .into_iter()
@@ -1910,7 +2105,9 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
                 .context("Project is not linked to ClickUp")?;
             let resolve = prefer_local
                 .map(|id| (id, Choice::Local))
-                .or(prefer_remote.map(|id| (id, Choice::Remote)));
+                .or(prefer_remote.map(|id| (id, Choice::Remote)))
+                .or(prefer_local_all.then_some((0, Choice::Local)))
+                .or(prefer_remote_all.then_some((0, Choice::Remote)));
             let report = sync(&store, &api, &link, resolve)?;
             crate::output(json_output, &report, || {
                 println!(
@@ -1948,6 +2145,7 @@ pub fn run(command: Command, database: &Path, json_output: bool) -> Result<()> {
         | Command::Disconnect
         | Command::Links
         | Command::Auto { .. }
+        | Command::Reset { .. }
         | Command::RetryCreate { .. } => unreachable!(),
     }
 }
@@ -2762,7 +2960,7 @@ mod tests {
         {
             let mut state = mock.state.lock().unwrap();
             for (path, value) in [
-                ("/user", json!({"user":{"timezone":"Europe/Stockholm"}})),
+                ("/user", json!({"user":{"id":7,"timezone":"Europe/Stockholm"}})),
                 ("/team", json!({"teams":[{"id":"w1","name":"Work"}]})),
                 ("/team/w1/space?archived=false", json!({"spaces":[{"id":"s1","name":"Engineering"}]})),
                 ("/space/s1/list?archived=false", json!({"lists":[{"id":"123","name":"Existing"},{"id":"456","name":"New"},{"id":"789","name":"Custom"}]})),
@@ -2773,7 +2971,20 @@ mod tests {
                 ("/list/789", json!({"statuses":[{"status":"open","type":"open"},{"status":"backlog","type":"open"},{"status":"in progress","type":"custom"},{"status":"closed","type":"closed"}]})),
             ] { state.responses.insert(path.into(), (200, value)); }
         }
+        refresh_sources(&store, &mock.api).unwrap();
+        assert!(sources(&store).unwrap().iter().all(|s| !s.enabled));
+        assert!(store.visible_projects().unwrap().is_empty());
+        assert_eq!(
+            auto_cycle_with_api(&store, &mock.api, true)
+                .unwrap()
+                .changed,
+            0
+        );
+        for id in ["123", "456", "789"] {
+            select_source(&store, id, true).unwrap();
+        }
         let first = auto_cycle_with_api(&store, &mock.api, true).unwrap();
+        assert_eq!(store.clickup_user_id().unwrap(), Some(7));
         assert_eq!(first.projects, 2);
         assert_eq!(first.changed, 1);
         assert_eq!(first.issues.len(), 1);
@@ -2834,6 +3045,23 @@ mod tests {
             .issues
             .is_empty());
         assert_eq!(store.task(task.id).unwrap().title, "Local edit");
+        for id in ["123", "456", "789"] {
+            select_source(&store, id, false).unwrap();
+        }
+        assert!(store.tasks(Scope::All, Status::All, "").unwrap().is_empty());
+        assert!(store.visible_projects().unwrap().is_empty());
+        assert_eq!(
+            auto_cycle_with_api(&store, &mock.api, true)
+                .unwrap()
+                .projects,
+            0
+        );
+        assert_eq!(store.task(task.id).unwrap().title, "Local edit");
+        select_source(&store, "123", true).unwrap();
+        assert_eq!(
+            store.tasks(Scope::All, Status::All, "").unwrap()[0].id,
+            task.id
+        );
         store
             .conn
             .execute("UPDATE clickup_preferences SET enabled=0", [])
@@ -2950,6 +3178,87 @@ mod tests {
         let reads = mock.state.lock().unwrap().task_reads;
         sync(&store, &mock.api, &link, None).unwrap();
         assert_eq!(mock.state.lock().unwrap().task_reads, reads);
+    }
+
+    #[test]
+    fn reset_backs_up_local_edits_and_reimports_without_remote_writes() {
+        let (dir, store, link) = setup();
+        let mock = Mock::new(vec![remote("r1", "Remote original")]);
+        sync(&store, &mock.api, &link, None).unwrap();
+        let task = store.tasks(Scope::All, Status::All, "").unwrap().remove(0);
+        store
+            .edit_task(
+                task.id,
+                TaskEdit {
+                    notes: Some("Unsynced edit".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let personal = store
+            .add_task("Keep personal", "", None, Priority::Normal, None)
+            .unwrap();
+        store
+            .add_task(
+                "Unsynced new task",
+                "",
+                Some(link.project_id),
+                Priority::Normal,
+                None,
+            )
+            .unwrap();
+        let database = dir.path().join("tasks.sqlite3");
+        assert!(reset_project(&store, &database, 999).is_err());
+        let backup = reset_project(&store, &database, link.project_id).unwrap();
+        let saved = Store::open(&backup).unwrap();
+        assert_eq!(saved.task(task.id).unwrap().notes, "Unsynced edit");
+        assert_eq!(saved.tasks(Scope::All, Status::All, "").unwrap().len(), 3);
+        assert!(store.task(personal.id).is_ok());
+        assert!(store
+            .tasks(Scope::Project(link.project_id), Status::All, "")
+            .unwrap()
+            .is_empty());
+        assert!(mappings(&store, link.project_id).unwrap().is_empty());
+        assert_eq!(links(&store).unwrap().len(), 1);
+        assert_eq!(sync(&store, &mock.api, &link, None).unwrap().imported, 1);
+        assert!(mock.state.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn project_wide_overrides_resolve_conflicts_in_both_directions() {
+        let (_dir, store, link) = setup();
+        let mock = Mock::new(vec![remote("r1", "One"), remote("r2", "Two")]);
+        sync(&store, &mock.api, &link, None).unwrap();
+        let tasks = store.tasks(Scope::All, Status::All, "").unwrap();
+        for (round, choice) in [Choice::Remote, Choice::Local].into_iter().enumerate() {
+            for task in &tasks {
+                store
+                    .edit_task(
+                        task.id,
+                        TaskEdit {
+                            title: Some(format!("Local {}", task.id)),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            for task in mock.state.lock().unwrap().tasks.values_mut() {
+                task["name"] = json!(format!("Remote changed {round}"));
+            }
+            assert_eq!(
+                sync(&store, &mock.api, &link, None).unwrap().issues.len(),
+                2
+            );
+            let report = sync(&store, &mock.api, &link, Some((0, choice))).unwrap();
+            assert!(report.issues.is_empty());
+            assert_eq!(report.pushed + report.pulled, 2);
+            for task in &tasks {
+                let local = store.task(task.id).unwrap();
+                let remote =
+                    &mock.state.lock().unwrap().tasks[local.clickup_id.as_ref().unwrap()]["name"];
+                assert_eq!(remote.as_str(), Some(local.title.as_str()));
+            }
+        }
     }
 
     #[test]

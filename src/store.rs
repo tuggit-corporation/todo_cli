@@ -61,6 +61,10 @@ pub struct Task {
     pub assignees: Vec<Assignee>,
     pub clickup_id: Option<String>,
     pub clickup_project: bool,
+    pub github_url: Option<String>,
+    pub github_assigned: bool,
+    pub github_project_url: Option<String>,
+    pub github_read_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -179,7 +183,7 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 5 {
+        if version > 14 {
             bail!("This database was created by a newer todo version; update todo first");
         }
         tx.execute_batch(
@@ -277,8 +281,186 @@ impl Store {
                  PRAGMA user_version = 5;",
             )?;
         }
+        if version < 6 {
+            tx.execute_batch(
+                "ALTER TABLE clickup_preferences ADD COLUMN user_id INTEGER;
+                              PRAGMA user_version = 6;",
+            )?;
+        }
+        if version < 7 {
+            tx.execute_batch("CREATE TABLE github_issues (
+                url TEXT PRIMARY KEY, repository TEXT NOT NULL, number INTEGER NOT NULL,
+                local_id INTEGER UNIQUE REFERENCES tasks(id) ON DELETE SET NULL,
+                base_done INTEGER NOT NULL, assigned INTEGER NOT NULL DEFAULT 1,
+                base_assignees TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE github_members(repository TEXT PRIMARY KEY, members TEXT NOT NULL);
+            CREATE TABLE github_preferences(id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO github_preferences(id) VALUES(1);
+            PRAGMA user_version=7;")?;
+        }
+        if version < 8 {
+            tx.execute_batch("CREATE TABLE github_projects (
+                project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                remote_id TEXT NOT NULL UNIQUE, owner TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL
+            );
+            CREATE TABLE github_project_items (
+                remote_id TEXT PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES github_projects(project_id) ON DELETE CASCADE,
+                local_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL, kind TEXT NOT NULL, content_id TEXT NOT NULL,
+                status TEXT, fields TEXT NOT NULL DEFAULT '', assigned INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            PRAGMA user_version=8;")?;
+        }
+        if version < 9 {
+            tx.execute_batch(
+                "CREATE TABLE github_sources (
+                kind TEXT NOT NULL CHECK(kind IN ('repo','project')), remote_id TEXT NOT NULL,
+                label TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+                project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+                PRIMARY KEY(kind,remote_id)
+            );
+            INSERT INTO github_sources(kind,remote_id,label,project_id)
+                SELECT 'project',remote_id,owner || ' / ' || title,project_id FROM github_projects;
+            INSERT INTO github_sources(kind,remote_id,label,project_id)
+                SELECT 'repo',g.repository,g.repository,min(t.project_id)
+                FROM github_issues g LEFT JOIN tasks t ON t.id=g.local_id GROUP BY g.repository;
+            CREATE INDEX github_sources_project ON github_sources(project_id,enabled);
+            CREATE INDEX github_project_items_local ON github_project_items(local_id,active,project_id);
+            PRAGMA user_version=9;",
+            )?;
+        }
+        if version < 10 {
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS github_sources_project ON github_sources(project_id,enabled);
+                 CREATE INDEX IF NOT EXISTS github_project_items_local ON github_project_items(local_id,active,project_id);
+                 PRAGMA user_version=10;"
+            )?;
+        }
+        if version < 11 {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS github_members(
+                   repository TEXT PRIMARY KEY, members TEXT NOT NULL
+                 );
+                 PRAGMA user_version=11;",
+            )?;
+        }
+        if version < 12 {
+            let has_baseline: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('github_issues') WHERE name='base_assignees')",
+                [], |r| r.get(0),
+            )?;
+            if !has_baseline {
+                tx.execute_batch(
+                    "ALTER TABLE github_issues ADD COLUMN base_assignees TEXT NOT NULL DEFAULT '[]';
+                     UPDATE github_issues SET base_assignees=COALESCE(
+                       (SELECT assignees FROM tasks WHERE id=github_issues.local_id),'[]'
+                     );"
+                )?;
+            }
+            tx.execute_batch("PRAGMA user_version=12;")?;
+        }
+        if version < 13 {
+            for (column, field) in [("base_title", "title"), ("base_body", "notes")] {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('github_issues') WHERE name=?1)",
+                    [column],
+                    |r| r.get(0),
+                )?;
+                if !exists {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE github_issues ADD COLUMN {column} TEXT NOT NULL DEFAULT '';
+                         UPDATE github_issues SET {column}=COALESCE(
+                           (SELECT {field} FROM tasks WHERE id=github_issues.local_id),''
+                         );"
+                    ))?;
+                }
+            }
+            tx.execute_batch("PRAGMA user_version=13;")?;
+        }
+        if version < 14 {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS clickup_sources(
+                   list_id TEXT PRIMARY KEY, label TEXT NOT NULL, location TEXT NOT NULL,
+                   enabled INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO clickup_sources(list_id,label,location)
+                   SELECT list_id,
+                     workspace || ' / ' || space || ' / ' || COALESCE(folder || ' / ','') ||
+                       CASE WHEN list_name='' THEN p.name ELSE list_name END,
+                     json_object('id',list_id,'name',CASE WHEN list_name='' THEN p.name ELSE list_name END,
+                       'workspace',workspace,'space',space,'folder',folder)
+                   FROM clickup_projects c JOIN projects p ON p.id=c.project_id;
+                 UPDATE clickup_preferences SET all_lists=0;
+                 PRAGMA user_version=14;"
+            )?;
+        }
         tx.commit()?;
         Ok(Self { conn })
+    }
+
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?)
+    }
+
+    pub fn clickup_user_id(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT user_id FROM clickup_preferences WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn assigned_to_me(&self, tasks: &mut Vec<Task>) -> Result<()> {
+        let id = self.clickup_user_id()?;
+        if id.is_none() && !crate::github::enabled(self)? {
+            bail!("Account identity is not cached yet; connect and sync ClickUp or GitHub first");
+        }
+
+        tasks.retain(|task| {
+            task.github_assigned
+                || ((task.clickup_project || task.clickup_id.is_some())
+                    && task.assignees.iter().any(|a| Some(a.id) == id))
+        });
+        Ok(())
+    }
+
+    pub fn github_context(&self, id: i64, scope: Scope) -> Result<String> {
+        let project = match scope {
+            Scope::Project(id) => Some(id),
+            _ => None,
+        };
+        let mut stmt = self.conn.prepare("SELECT p.owner,p.title,i.status,i.fields FROM github_project_items i JOIN github_projects p ON p.project_id=i.project_id JOIN github_sources s ON s.kind='project' AND s.remote_id=p.remote_id WHERE i.local_id=?1 AND i.active=1 AND s.enabled=1 AND (?2 IS NULL OR i.project_id=?2) ORDER BY p.owner,p.title")?;
+        let lines = stmt.query_map(params![id, project], |r| {
+            Ok(format!(
+                "{} / {}: {} {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?
+                    .unwrap_or_else(|| "No project status".into()),
+                r.get::<_, String>(3)?
+            ))
+        })?;
+        Ok(lines.collect::<rusqlite::Result<Vec<_>>>()?.join("\n"))
+    }
+
+    pub fn github_buckets(&self, scope: Scope) -> Result<std::collections::HashMap<i64, String>> {
+        let project = match scope {
+            Scope::Project(id) => Some(id),
+            _ => None,
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT i.local_id,group_concat(COALESCE(i.status,'No status'),' / ')
+             FROM github_project_items i JOIN github_projects p ON p.project_id=i.project_id
+             JOIN github_sources s ON s.kind='project' AND s.remote_id=p.remote_id
+             WHERE i.local_id IS NOT NULL AND i.active=1 AND s.enabled=1
+               AND (?1 IS NULL OR NOT EXISTS(SELECT 1 FROM github_projects WHERE project_id=?1) OR i.project_id=?1)
+             GROUP BY i.local_id"
+        )?;
+        let rows = stmt.query_map([project], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn projects(&self) -> Result<Vec<Project>> {
@@ -289,6 +471,24 @@ impl Store {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn visible_projects(&self) -> Result<Vec<Project>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id,p.name FROM projects p
+             WHERE (NOT EXISTS(SELECT 1 FROM github_sources WHERE project_id=p.id)
+                OR EXISTS(SELECT 1 FROM github_sources WHERE project_id=p.id AND enabled=1))
+               AND NOT EXISTS(SELECT 1 FROM clickup_projects c JOIN clickup_sources s ON s.list_id=c.list_id
+                          WHERE c.project_id=p.id AND s.enabled=0)
+             ORDER BY p.name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Project {
+                id: r.get(0)?,
+                name: r.get(1)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -383,12 +583,29 @@ impl Store {
         Ok(serde_json::from_str(&raw)?)
     }
 
+    pub fn github_members(&self, id: i64) -> Result<Vec<Assignee>> {
+        let raw: Option<String> = self.conn.query_row(
+            "SELECT m.members FROM github_issues i LEFT JOIN github_members m ON m.repository=i.repository WHERE i.local_id=?1",
+            [id], |r| r.get(0)).optional()?.flatten();
+        Ok(serde_json::from_str(raw.as_deref().unwrap_or("[]"))?)
+    }
+
+    pub fn is_github_project(&self, project: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM github_projects WHERE project_id=?1) OR EXISTS(SELECT 1 FROM github_issues g JOIN tasks t ON t.id=g.local_id WHERE t.project_id=?1)",
+            [project], |r| r.get(0))?)
+    }
+
     pub fn assign(&self, id: i64, ids: &[i64]) -> Result<Task> {
         let task = self.task(id)?;
-        let project = task
-            .project_id
-            .context("Assignees require a ClickUp project")?;
-        let members = self.members(project)?;
+        let members = if task.github_url.is_some() {
+            self.github_members(id)?
+        } else {
+            self.members(
+                task.project_id
+                    .context("Assignees require a connected project")?,
+            )?
+        };
         let mut assignees = Vec::new();
         for id in ids {
             let member = members
@@ -441,15 +658,26 @@ impl Store {
         self.task(self.conn.last_insert_rowid())
     }
 
-    pub fn edit_task(&self, id: i64, edit: TaskEdit) -> Result<Task> {
+    pub fn edit_task(&self, id: i64, mut edit: TaskEdit) -> Result<Task> {
+        if let Some(assignees) = &mut edit.assignees {
+            assignees.sort_by_key(|a| a.id);
+            assignees.dedup_by_key(|a| a.id);
+        }
         let current = self.task(id)?;
         let destination = edit.project.unwrap_or(current.project_id);
         self.check_priority(destination, edit.priority.unwrap_or(current.priority))?;
-        if edit.assignees.is_some() && !self.is_clickup_project(destination)? {
-            bail!("Assignees can only be changed in ClickUp projects");
+        if edit.assignees.is_some()
+            && !self.is_clickup_project(destination)?
+            && current.github_url.is_none()
+        {
+            bail!("Assignees can only be changed for connected tasks");
         }
         if let Some(assignees) = &edit.assignees {
-            let members = self.members(destination.unwrap())?;
+            let members = if current.github_url.is_some() {
+                self.github_members(id)?
+            } else {
+                self.members(destination.unwrap())?
+            };
             if let Some(invalid) = assignees.iter().find(|a| {
                 !members.iter().any(|m| m.id == a.id)
                     && !current.assignees.iter().any(|m| m.id == a.id)
@@ -505,6 +733,9 @@ impl Store {
     }
 
     pub fn set_done(&self, id: i64, done: bool) -> Result<Task> {
+        if self.task(id)?.github_read_only {
+            bail!("GitHub project draft/PR items are read-only; change their state in GitHub");
+        }
         if self.conn.execute(
             "UPDATE tasks SET done = ?1, in_progress = 0,
              completed_at = CASE WHEN ?1 = 0 THEN NULL WHEN done = 0 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE completed_at END,
@@ -562,11 +793,26 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "{TASK_SELECT}
              WHERE (?1 = 0 OR t.project_id IS NULL)
-               AND (?2 IS NULL OR t.project_id = ?2)
+               AND (?2 IS NULL OR (t.project_id = ?2 AND NOT EXISTS(SELECT 1 FROM github_projects WHERE project_id=?2)) OR EXISTS(SELECT 1 FROM github_project_items g WHERE g.local_id=t.id AND g.project_id=?2 AND g.active=1))
                AND (?3 IS NULL OR t.done = ?3)
                AND (?4 = '' OR instr(lower(t.title || char(10) || t.notes), lower(?4)) > 0)
                AND (?5 = 0 OR t.in_progress = 1)
-             ORDER BY t.done, CASE COALESCE(t.priority_extra,t.priority) WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+               AND NOT EXISTS(SELECT 1 FROM clickup_projects c JOIN clickup_sources s ON s.list_id=c.list_id
+                              WHERE c.project_id=t.project_id AND s.enabled=0)
+               AND NOT EXISTS(SELECT 1 FROM clickup_tasks m JOIN clickup_projects c ON c.project_id=m.project_id
+                              JOIN clickup_sources s ON s.list_id=c.list_id WHERE m.local_id=t.id AND s.enabled=0)
+               AND (?2 IS NULL OR NOT EXISTS(SELECT 1 FROM github_sources WHERE project_id=?2)
+                    OR EXISTS(SELECT 1 FROM github_sources WHERE project_id=?2 AND enabled=1))
+               AND (
+                 (NOT EXISTS(SELECT 1 FROM github_issues WHERE local_id=t.id)
+                  AND NOT EXISTS(SELECT 1 FROM github_project_items WHERE local_id=t.id))
+                 OR EXISTS(SELECT 1 FROM github_issues g JOIN github_sources s ON s.kind='repo' AND s.remote_id=g.repository WHERE g.local_id=t.id AND s.enabled=1)
+                 OR EXISTS(SELECT 1 FROM github_project_items i JOIN github_projects p ON p.project_id=i.project_id
+                   JOIN github_sources s ON s.kind='project' AND s.remote_id=p.remote_id
+                   WHERE i.local_id=t.id AND i.active=1 AND s.enabled=1)
+               )
+             ORDER BY t.done, t.deadline IS NULL, t.deadline,
+                      CASE COALESCE(t.priority_extra,t.priority) WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
                       t.id DESC"
         ))?;
         let rows = stmt.query_map(
@@ -602,7 +848,11 @@ fn extra_priority(priority: Priority) -> Option<&'static str> {
 const TASK_SELECT: &str = "SELECT t.id, t.title, t.notes, t.project_id, p.name, COALESCE(t.priority_extra,t.priority), t.done,
             t.created_at, t.updated_at, t.deadline, t.in_progress, t.completed_at, t.start_date, t.assignees,
             (SELECT remote_id FROM clickup_tasks WHERE local_id=t.id),
-            EXISTS(SELECT 1 FROM clickup_projects WHERE project_id=t.project_id)
+            EXISTS(SELECT 1 FROM clickup_projects WHERE project_id=t.project_id),
+            (SELECT url FROM github_issues WHERE local_id=t.id),
+            (COALESCE((SELECT assigned FROM github_issues WHERE local_id=t.id),0) OR EXISTS(SELECT 1 FROM github_project_items i JOIN github_projects p ON p.project_id=i.project_id JOIN github_sources s ON s.kind='project' AND s.remote_id=p.remote_id WHERE i.local_id=t.id AND i.assigned=1 AND i.active=1 AND s.enabled=1)),
+            (SELECT p.url FROM github_project_items i JOIN github_projects p ON p.project_id=i.project_id WHERE i.local_id=t.id LIMIT 1),
+            EXISTS(SELECT 1 FROM github_project_items WHERE local_id=t.id AND kind!='Issue')
             FROM tasks t LEFT JOIN projects p ON p.id = t.project_id";
 
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -632,12 +882,229 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         })?,
         clickup_id: row.get(14)?,
         clickup_project: row.get(15)?,
+        github_url: row.get(16)?,
+        github_assigned: row.get(17)?,
+        github_project_url: row.get(18)?,
+        github_read_only: row.get(19)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrating_v9_adds_missing_lookup_indexes_without_changing_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = Store::open(&path).unwrap();
+        let task = store
+            .add_task("Keep", "", None, Priority::Normal, None)
+            .unwrap();
+        store.conn.execute_batch(
+            "DROP INDEX github_sources_project; DROP INDEX github_project_items_local; PRAGMA user_version=9;"
+        ).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.task(task.id).unwrap().title, "Keep");
+        for (query,index) in [
+            ("EXPLAIN QUERY PLAN SELECT 1 FROM github_sources WHERE project_id=1 AND enabled=1","github_sources_project"),
+            ("EXPLAIN QUERY PLAN SELECT 1 FROM github_project_items WHERE local_id=1 AND active=1","github_project_items_local")
+        ] {
+            let mut stmt = store.conn.prepare(query).unwrap();
+            let details = stmt.query_map([], |r| r.get::<_,String>(3)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap().join(" ");
+            assert!(details.contains(index),"{details}");
+        }
+    }
+
+    #[test]
+    fn migrating_v10_repairs_missing_github_assignee_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = Store::open(&path).unwrap();
+        let task = store
+            .add_task("Issue", "Keep notes", None, Priority::Normal, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO github_issues(url,repository,number,local_id,base_done)
+             VALUES('https://github.com/acme/repo/issues/1','acme/repo',1,?1,0)",
+                [task.id],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO github_sources(kind,remote_id,label,enabled) VALUES('repo','acme/repo','acme/repo',1)", []
+        ).unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE github_members; PRAGMA user_version=10;")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.github_members(task.id).unwrap().is_empty());
+        assert_eq!(store.task(task.id).unwrap().notes, "Keep notes");
+        assert!(crate::github::sources::list(&store).unwrap()[0].enabled);
+        store.conn.execute(
+            "INSERT INTO github_members(repository,members) VALUES('acme/repo','[{\"id\":7,\"username\":\"sam\"}]')", []
+        ).unwrap();
+        assert_eq!(
+            store.assign(task.id, &[7]).unwrap().assignees[0].label(),
+            "sam"
+        );
+        assert!(store.assign(task.id, &[]).unwrap().assignees.is_empty());
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.github_members(task.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrating_v13_makes_existing_clickup_lists_opt_in_without_deleting_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = Store::open(&path).unwrap();
+        let project = store.add_project("Old ClickUp List").unwrap();
+        store.conn.execute("INSERT INTO clickup_projects(project_id,list_id,open_status,working_status,done_status,timezone,workspace,space,list_name) VALUES(?1,'123','open','working','done','UTC','Work','Space','List')",[project.id]).unwrap();
+        let task = store
+            .add_task("Keep", "Notes", Some(project.id), Priority::High, None)
+            .unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE clickup_sources; PRAGMA user_version=13;")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let sources = crate::clickup::sources(&store).unwrap();
+        assert_eq!(sources[0].label, "Work / Space / List");
+        assert!(!sources[0].enabled);
+        assert!(store.visible_projects().unwrap().is_empty());
+        assert!(store.tasks(Scope::All, Status::All, "").unwrap().is_empty());
+        assert_eq!(store.task(task.id).unwrap().notes, "Notes");
+        crate::clickup::select_source(&store, "123", true).unwrap();
+        assert_eq!(
+            store.tasks(Scope::All, Status::All, "").unwrap()[0].id,
+            task.id
+        );
+        drop(store);
+        assert!(crate::clickup::sources(&Store::open(&path).unwrap()).unwrap()[0].enabled);
+    }
+
+    #[test]
+    fn migrating_v12_baselines_existing_text_without_resetting_sync_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = Store::open(&path).unwrap();
+        let task = store
+            .add_task(
+                "Local snapshot",
+                "Existing notes",
+                None,
+                Priority::Normal,
+                None,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO github_issues(url,repository,number,local_id,base_done)
+             VALUES('https://github.com/acme/repo/issues/1','acme/repo',1,?1,0)",
+                [task.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE github_issues DROP COLUMN base_title;
+             ALTER TABLE github_issues DROP COLUMN base_body;
+             PRAGMA user_version=12;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let baseline: (String, String, bool) = store
+            .conn
+            .query_row(
+                "SELECT base_title,base_body,base_done FROM github_issues WHERE local_id=?1",
+                [task.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            baseline,
+            ("Local snapshot".into(), "Existing notes".into(), false)
+        );
+        assert_eq!(store.task(task.id).unwrap().notes, "Existing notes");
+    }
+
+    #[test]
+    fn migrating_legacy_github_assignments_preserves_a_safe_baseline_and_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = Store::open(&path).unwrap();
+        let task = store
+            .add_task("Issue", "", None, Priority::Normal, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET assignees='[{\"id\":7,\"username\":\"sam\"}]' WHERE id=?1",
+                [task.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO github_issues(url,repository,number,local_id,base_done)
+             VALUES('https://github.com/acme/repo/issues/1','acme/repo',1,?1,0),
+                   ('https://github.com/acme/repo/issues/2','acme/repo',2,NULL,0)",
+                [task.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE github_issues DROP COLUMN base_assignees;
+             DROP TABLE github_members;
+             PRAGMA user_version=10;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let baseline: String = store
+            .conn
+            .query_row(
+                "SELECT base_assignees FROM github_issues WHERE local_id=?1",
+                [task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<Assignee>>(&baseline).unwrap(),
+            store.task(task.id).unwrap().assignees
+        );
+        assert!(store.github_members(task.id).unwrap().is_empty());
+        let tombstone: (Option<i64>, String) = store
+            .conn
+            .query_row(
+                "SELECT local_id,base_assignees FROM github_issues WHERE number=2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tombstone, (None, "[]".into()));
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let saved: String = store
+            .conn
+            .query_row(
+                "SELECT base_assignees FROM github_issues WHERE local_id=?1",
+                [task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(baseline, saved);
+    }
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -757,7 +1224,14 @@ mod tests {
              ALTER TABLE clickup_projects DROP COLUMN folder;
              ALTER TABLE clickup_projects DROP COLUMN list_name;
              ALTER TABLE clickup_projects DROP COLUMN members;
+             DROP TABLE clickup_sources;
              DROP TABLE clickup_preferences;
+             DROP TABLE github_issues;
+             DROP TABLE github_sources;
+             DROP TABLE github_members;
+             DROP TABLE github_project_items;
+             DROP TABLE github_projects;
+             DROP TABLE github_preferences;
              PRAGMA user_version=4;",
             )
             .unwrap();
@@ -900,6 +1374,29 @@ mod tests {
         assert!(store.set_done(999, true).is_err());
         assert!(store.delete_task(999).is_err());
         assert!(store.tasks(Scope::Project(999), Status::All, "").is_err());
+    }
+
+    #[test]
+    fn tasks_sort_by_due_date_before_priority_with_undated_last() {
+        let (_dir, store) = store();
+        let undated = store
+            .add_task("Undated high", "", None, Priority::High, None)
+            .unwrap();
+        let later = store
+            .add_task("Later high", "", None, Priority::High, Some("20261201"))
+            .unwrap();
+        let earlier = store
+            .add_task("Earlier low", "", None, Priority::Low, Some("20260601"))
+            .unwrap();
+        assert_eq!(
+            store
+                .tasks(Scope::All, Status::Open, "")
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            [earlier.id, later.id, undated.id]
+        );
     }
 
     #[test]

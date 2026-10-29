@@ -15,6 +15,7 @@ machine-readable API. Works on Linux and macOS, including Apple Silicon.
 - Release automation and a Homebrew formula template for distribution.
 - Automatic two-way ClickUp sync, List discovery, assignees, and planned start/due dates.
 - Source, Workspace, and Space filters with exact ClickUp priorities.
+- Opt-in GitHub repository/Project sync through `gh`, with two-way issue close/reopen sync.
 
 Local planning needs no account, background service, or internet connection.
 The optional ClickUp integration requires your ClickUp account and network access.
@@ -99,16 +100,18 @@ selection; the other panel stays muted. Use `h`/`l` or `Tab` to switch focus.
 | `p` | Cycle task priority |
 | `P` | Create a project |
 | `C` | Discover ClickUp Lists, select them, and import into separate projects |
-| `S` | Sync the selected task's project or the selected project with ClickUp |
+| `S` | Sync the selected GitHub issue source or ClickUp project |
 | `f` | Filter by All sources, Local, ClickUp, Workspace, or Space |
-| `A` | Change ClickUp assignees; `Space` toggles members, `Enter` saves |
+| `A` | Change ClickUp/GitHub assignees; `Space` toggles members, `Enter` saves |
+| `b` | Move a GitHub Project item between status buckets |
+| `m` | Toggle “Assigned to me” across imported ClickUp and GitHub tasks |
 | `I` | Inspect automatic-sync errors and conflicts |
 | `d` | Delete selected task/project, after confirmation |
 | `/` | Search titles and notes in the current list |
 | `Esc` | Clear search |
 | `s` | Cycle open/all/completed/in-progress tasks |
 | `r` | Reload local data |
-| `?` | Help |
+| `?` | Settings popup (integrations, GitHub sources, filters, sync issues, keyboard help) |
 | `q` / `Ctrl-c` | Quit |
 
 Forms start in text-entry mode: type to append, `Backspace` to remove, and
@@ -133,10 +136,127 @@ not an invented historical timestamp. Imported ClickUp tasks use ClickUp's close
 time when available.
 
 The task panel shows status, priority, due date, assignees, source (`CU` for
-ClickUp), and title in aligned columns. Details include planned start/due dates
+ClickUp, `GH` for GitHub), and title in aligned columns. Tasks sort by planned
+finish/due date, earliest first, with undated tasks last; priority breaks ties.
+Open tasks precede completed ones in the All view. Details include planned start/due dates
 and actual completion time separately. Press `f` to narrow the source; selecting
 a source resets the sidebar to All tasks, then you can choose a specific List's
 project. Source, status, project, and search filters combine.
+Press `m` to restrict the current view to tasks assigned to your connected
+ClickUp/GitHub account (including tasks shared with other assignees). Press it again
+to show all assignees. This combines with the other filters and works offline
+after your account identity has been cached by connecting or syncing.
+It only filters imported tasks; it does not discover additional Lists.
+
+The CLI equivalent is `todo task list --assigned-to-me`, optionally combined
+with `--project`, `--status all`, `--search`, or `--json`. If your account identity
+is not cached, connect/sync first; it never guesses your identity from a name.
+
+## GitHub Issues
+
+Install [GitHub CLI (`gh`)](https://cli.github.com/) first (for example
+`brew install gh` on macOS), then connect once:
+
+```sh
+todo github connect
+todo
+```
+
+For source builds, use `cargo run -- github connect` and `cargo run --`.
+You can also open **`?` -> Connect GitHub** directly in the TUI.
+Connect uses `gh auth login --hostname github.com --web`; tokens are managed
+by `gh`, not stored by todo. If already authenticated, you can instead run
+`todo github sync` once to enable the integration without logging in again.
+
+**Nothing from GitHub is selected by default**, including when upgrading an
+existing workspace. Open **`?` -> GitHub sources (add / remove)** and use `j/k`
+to navigate, `/` to search names (`Enter` finishes searching), and `Space` to
+toggle a repository or Project. Changes save immediately; `Esc` goes back.
+`r` refreshes the available sources without importing their tasks. The catalog
+includes accessible repositories and Projects v2 owned by your account or
+organizations you belong to.
+
+Only selected sources import tasks and refresh at startup and every 60 seconds.
+Selected repositories import their open issues (not only yours); use `m`, or
+**`?` -> Toggle assigned to me**, to narrow the view. Unchecking a source stops
+its sync and hides its cached tasks/sidebar entry, without deleting local data
+or changing GitHub. Re-enabling restores cached tasks and resumes sync. An issue
+remains visible if another selected source includes it.
+
+Issues appear under `GitHub: owner/repo`; Projects appear as
+`GitHub Project: owner / title`. Filters, account setup, sync issues, and
+keyboard help are all available from `?`; existing shortcuts still work and
+`h` remains left-panel navigation.
+Private repositories require appropriate `gh` permissions and organization SSO.
+Project discovery requires `read:project`; bucket moves require write access
+and the broader `project` scope (requested during connect). For an
+existing login, grant it once:
+
+```sh
+gh auth refresh --hostname github.com --scopes project
+```
+
+All accessible items in selected Projects are included, not only your assignments:
+issues, pull requests, and draft items. Press `m` to show only your assignments.
+An issue present in several Projects shares one local task, so changes do not
+create duplicates. Selecting a Project shows its membership; details display
+its status and date/single-select field values. **Project status is independent
+of issue state:** a project item marked Done does not close its issue.
+Press **`b`** on an item to choose a status bucket (`j/k`, `Enter` to move,
+`Esc` to cancel). Inside a Project view, only that Project's buckets appear;
+elsewhere, options are labeled by Project. `No status` clears the field.
+The task list displays the cached current bucket; the picker marks the live
+current option with `[current]` and selects it initially. Bucket actions use
+their own background worker, so full-account sync does not hold up the picker
+or a move.
+This works for issues, drafts, and PRs without changing issue/PR open state.
+The move runs in the background, checks for a changed remote status, and
+confirms GitHub's result before updating the local cache. Failed/offline moves
+show an error; reopen the picker to retry. Project permissions and SSO apply.
+GitHub provides no atomic compare-and-set for these moves, so avoid simultaneous
+status edits on GitHub while a move is in flight.
+
+Draft/PR content and other project fields remain read-only; issue closing/reopening and
+issue assignee editing remain two-way. Hidden/inaccessible items or owners
+produce warnings without deleting cached tasks. Removed project memberships
+stop appearing in that Project; cached tasks remain stored and only appear
+if another selected source still includes them.
+
+Press `Space` to close/reopen an issue; GitHub changes also flow back to todo.
+Press `A` to select GitHub assignees from the repository's assignable users
+(cached during refresh); `Space` toggles users and `Enter` saves. Existing
+assignees are shown too. Assignment changes sync both ways, including clearing
+all assignees. Repository permissions still apply; rejected changes stay local
+and show an error. Concurrent differing assignment changes are reported as
+conflicts rather than overwritten.
+The bottom action bar changes with the selected task's source and panel focus,
+so GitHub-only, ClickUp, and local actions are clearly distinguished.
+Local changes queue automatic sync while the TUI is open; CLI task mutations
+also attempt to sync. Offline saves stay local and retry on the next cycle.
+Errors appear in the TUI footer without deleting local data.
+Previously imported issues continue syncing after closing or reassignment,
+as long as one of their sources remains selected.
+Local deletion never deletes the GitHub issue/project item and prevents automatic reimport.
+
+Press `e` to edit an issue's title and notes (GitHub description); both sync
+automatically in both directions. Clearing notes clears the description.
+If the same field changes differently on both sides, sync reports a conflict
+and preserves local edits instead of overwriting either copy. To resolve it,
+make that field agree in todo and GitHub, then sync again. Edits to different
+fields merge independently; local edits made during a request remain pending.
+On upgrading, existing local title/notes become the initial baseline, so old
+local-only edits are not silently pushed to GitHub.
+Open/closed state and assignees also sync both ways. Priorities, planned dates, and in-progress
+markers are local-only for GitHub issues. Adding a local
+task in a GitHub project does **not** create an issue. Writing GitHub Project
+custom fields other than Status and GitHub Enterprise Server are not supported. Repository issue search is
+limited by GitHub search to 1,000 open issues per selected repository; incomplete searches
+produce a warning.
+
+`todo github sync` forces a refresh. `todo github disconnect` disables automatic
+sync while retaining imported tasks and your `gh` credentials.
+`todo github sources` refreshes/lists the source catalog without importing tasks;
+use the `?` popup to change selections.
 
 Deleting a project preserves its tasks by moving them to Personal. Deleting a
 task is permanent. The TUI refreshes every two seconds while outside a form,
@@ -205,9 +325,17 @@ same local database concurrently.
 
 ## ClickUp integration
 
-Each ClickUp List maps to a local project. Once connected, `todo` automatically
-discovers **all accessible Lists** at TUI startup, including new Lists, and
-refreshes them every **60 seconds** while the TUI is open. Local edits trigger
+Each ClickUp List maps to a local project. Open **`?` -> ClickUp sources
+(add / remove)** to choose Lists, just like GitHub sources: `j/k` navigates,
+`/` searches names, `Space` toggles a List, and `r` refreshes the catalog.
+Names include Workspace / Space / Folder / List to distinguish similar Lists.
+**All Lists start unchecked**, including previously synced Lists on upgrading.
+Unchecking stops background sync and hides cached tasks and sidebar entries
+without deleting anything locally or in ClickUp. Re-enabling restores cached
+tasks. New Lists remain unchecked until you select them; catalog discovery
+does not import tasks.
+
+Selected Lists refresh at startup and every **60 seconds** while the TUI is open. Local edits trigger
 a debounced background sync; CLI task mutations also attempt to sync linked
 tasks. No separate daemon is needed, and the UI remains usable during sync.
 Titles, Markdown descriptions, exact priorities, assignees, planned start/due
@@ -262,8 +390,9 @@ distribution is not implemented.
 
 ### Link a List and sync
 
-**Normally:** connect and start `todo`; accessible Lists are linked/imported
-automatically. Standard, unambiguous status mappings are detected. If a List's
+**Normally:** connect, start `todo`, and select Lists under **`?` -> ClickUp
+sources**; only selected Lists are linked/imported automatically.
+Standard, unambiguous status mappings are detected. If a List's
 statuses are ambiguous, it is skipped with an issue: press **`C`** to select its
 open/working/completed statuses once. You can also import manually:
 
@@ -276,9 +405,8 @@ Folders. Choose List numbers (e.g. `1,3`), confirm your ClickUp timezone, and
 select the matching task statuses. Each selected List is imported into its own
 new `ClickUp: <List name>` project; existing personal projects are untouched.
 Selecting an already linked List syncs its existing project instead of creating
-a duplicate. Cancel with an empty selection. Automatic discovery includes all
-accessible Lists regardless of the manual picker's selection; disable it above
-if you want only manually selected Lists.
+a duplicate. Cancel with an empty selection. Choosing a List in this manual
+setup also enables that source; other Lists remain unchanged.
 
 Discovery only shows non-archived Lists your token can access through the
 workspace hierarchy. Permission failures are reported without hiding Lists
@@ -364,6 +492,37 @@ todo clickup sync 1 --prefer-remote 42
 ```
 
 These options resolve only the specified task; other conflicts stay unresolved.
+For a one-time project-wide override, choose **one** direction:
+
+```sh
+todo clickup sync 3 --prefer-remote-all  # ClickUp wins; discard local differences.
+todo clickup sync 3 --prefer-local-all   # Local wins; overwrite supported remote fields.
+```
+
+These are explicit overrides, not a permanent conflict policy. Other projects
+are unaffected. New unmapped local tasks still upload during sync; use reset
+instead if you want to discard them too.
+
+### Reset an imported project's local cache
+
+Close running TUI instances first. To start over from ClickUp for one project:
+
+```sh
+todo clickup links
+todo clickup reset 3 --confirm
+todo clickup sync 3
+```
+
+Reset makes a full SQLite backup next to your database and prints its path.
+It then removes that project's local tasks, sync baselines, and tombstones,
+including unsynced tasks/edits and mapped tasks moved to another project.
+Personal tasks and other ClickUp projects remain untouched. The List link and
+status mappings are retained; the next sync reimports the current remote tasks,
+including tasks previously deleted locally. **Nothing is deleted in ClickUp.**
+Reset requires `--confirm`, works without credentials, and fails safely if it
+cannot create the backup. It does not repair invalid status mappings; those
+need to be corrected separately.
+
 The chosen copy wins for the supported fields, not ClickUp-only data such as
 attachments, comments, tags, or custom fields.
 

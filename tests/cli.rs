@@ -14,6 +14,58 @@ fn run(db: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[test]
+fn github_tasks_participate_in_assigned_filter_without_clickup_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tasks.sqlite3");
+    let task = ok(&db, &["task", "add", "GitHub issue"]);
+    ok(&db, &["task", "add", "Personal"]);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("UPDATE github_preferences SET enabled=1", [])
+        .unwrap();
+    conn.execute("INSERT INTO github_issues(url,repository,number,local_id,base_done) VALUES('https://github.com/acme/repo/issues/1','acme/repo',1,?1,0)", [task["id"].as_i64().unwrap()]).unwrap();
+    conn.execute("INSERT INTO github_sources(kind,remote_id,label,enabled) VALUES('repo','acme/repo','acme/repo',1)", []).unwrap();
+    let tasks = ok(&db, &["task", "list", "--assigned-to-me"]);
+    assert_eq!(tasks.as_array().unwrap().len(), 1);
+    assert_eq!(
+        tasks[0]["github_url"],
+        "https://github.com/acme/repo/issues/1"
+    );
+    assert_eq!(tasks[0]["github_assigned"], true);
+    ok(&db, &["github", "disconnect"]);
+    assert_eq!(ok(&db, &["task", "list"]).as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn clickup_reset_requires_confirmation_and_preserves_a_readable_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tasks.sqlite3");
+    let project = ok(&db, &["project", "add", "Linked"])["id"]
+        .as_i64()
+        .unwrap();
+    let id = project.to_string();
+    let local = ok(&db, &["task", "add", "Local"]);
+    let imported = ok(&db, &["task", "add", "Imported", "--project", &id]);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("INSERT INTO clickup_projects(project_id,list_id,open_status,working_status,done_status,timezone) VALUES (?1,'123','to do','in progress','closed','UTC')", [project]).unwrap();
+    assert!(!run(&db, &["clickup", "reset", &id]).status.success());
+    assert!(ok(&db, &["task", "show", &imported["id"].to_string()]).is_object());
+    let reset = ok(&db, &["clickup", "reset", &id, "--confirm"]);
+    let backup = Path::new(reset["backup"].as_str().unwrap());
+    assert!(backup.exists());
+    assert_eq!(ok(backup, &["task", "list"]).as_array().unwrap().len(), 2);
+    assert_eq!(ok(&db, &["task", "list"]), serde_json::json!([local]));
+    for flags in [
+        vec!["--prefer-local-all", "--prefer-remote-all"],
+        vec!["--prefer-local", "1", "--prefer-remote-all"],
+        vec!["--prefer-remote", "0"],
+    ] {
+        let mut args = vec!["clickup", "sync", &id];
+        args.extend(flags);
+        assert!(!run(&db, &args).status.success());
+    }
+}
+
 fn ok(db: &Path, args: &[&str]) -> Value {
     let output = run(db, args);
     assert!(
@@ -22,6 +74,83 @@ fn ok(db: &Path, args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn assigned_to_me_filters_by_cached_account_id_and_combines_with_other_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tasks.sqlite3");
+    let project = ok(&db, &["project", "add", "Linked"])["id"]
+        .as_i64()
+        .unwrap();
+    let mine = ok(
+        &db,
+        &[
+            "task",
+            "add",
+            "Shared report",
+            "--project",
+            &project.to_string(),
+        ],
+    );
+    let other = ok(
+        &db,
+        &[
+            "task",
+            "add",
+            "Other report",
+            "--project",
+            &project.to_string(),
+        ],
+    );
+    ok(&db, &["task", "add", "Personal"]);
+    assert!(!run(&db, &["task", "list", "--assigned-to-me"])
+        .status
+        .success());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("INSERT INTO clickup_projects(project_id,list_id,open_status,working_status,done_status,timezone) VALUES (?1,'123','to do','in progress','closed','UTC')", [project]).unwrap();
+    conn.execute("UPDATE clickup_preferences SET user_id=7,enabled=0", [])
+        .unwrap();
+    conn.execute("UPDATE tasks SET assignees='[{\"id\":7,\"username\":\"Same name\"},{\"id\":8,\"username\":\"Other\"}]' WHERE id=?1", [mine["id"].as_i64().unwrap()]).unwrap();
+    conn.execute(
+        "UPDATE tasks SET assignees='[{\"id\":8,\"username\":\"Same name\"}]' WHERE id=?1",
+        [other["id"].as_i64().unwrap()],
+    )
+    .unwrap();
+    let assigned = ok(&db, &["task", "list", "--assigned-to-me"]);
+    assert_eq!(assigned.as_array().unwrap().len(), 1);
+    assert_eq!(assigned[0]["id"], mine["id"]);
+    assert!(ok(&db, &["task", "list", "--assigned-to-me", "--personal"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(ok(
+        &db,
+        &["task", "list", "--assigned-to-me", "--search", "Other"]
+    )
+    .as_array()
+    .unwrap()
+    .is_empty());
+    ok(&db, &["task", "done", &mine["id"].to_string()]);
+    assert!(ok(&db, &["task", "list", "--assigned-to-me"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        ok(
+            &db,
+            &[
+                "task",
+                "list",
+                "--assigned-to-me",
+                "--status",
+                "done",
+                "--project",
+                &project.to_string()
+            ]
+        )[0]["id"],
+        mine["id"]
+    );
 }
 
 #[test]
