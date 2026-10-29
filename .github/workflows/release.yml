@@ -85,4 +85,9 @@ jobs:
           Path("dist/todo.rb").write_text(formula)
           PY
       - name: Publish GitHub release
-        run: gh release create "$TAG" dist/* --verify-tag --title "todo ${TAG#v}" --generate-notes
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "todo ${TAG#v}" --generate-notes
+          fi
