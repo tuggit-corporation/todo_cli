@@ -12,7 +12,13 @@ use reqwest::{
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{collections::HashSet, fs::OpenOptions, io::IsTerminal, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::OpenOptions,
+    io::IsTerminal,
+    path::Path,
+    time::Duration,
+};
 
 const TOKEN_URL: &str = "https://app.clickup.com/settings/apps";
 
@@ -455,9 +461,25 @@ struct Api {
     base: String,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     rate_limited: std::cell::Cell<bool>,
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    writing: std::cell::Cell<bool>,
+    last_request: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+struct WriteGuard<'a>(&'a std::cell::Cell<bool>);
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 impl Api {
+    fn protect_write(&self) -> WriteGuard<'_> {
+        // Verify and baseline in-flight writes before yielding to newer edits.
+        self.writing.set(true);
+        WriteGuard(&self.writing)
+    }
+
     fn new(token: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         let mut authorization = HeaderValue::from_str(token)
@@ -475,27 +497,45 @@ impl Api {
             base: "https://api.clickup.com/api/v2".into(),
             cancel: None,
             rate_limited: std::cell::Cell::new(false),
+            interrupt: None,
+            writing: std::cell::Cell::new(false),
+            last_request: std::cell::Cell::new(None),
         })
     }
 
     fn request(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        if !self.writing.get()
+            && self
+                .interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            bail!("Background refresh paused to send local edits");
+        }
         if self.rate_limited.get() {
             bail!("ClickUp returned HTTP 429. Rate limited; wait for the next sync cycle.");
         }
-        if self
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        if !self.writing.get()
+            && self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
         {
             bail!("Sync stopped; pending local changes will be retried next time");
         }
         let mut request = self.client.request(method, format!("{}{path}", self.base));
         if self.cancel.is_some() {
+            if let Some(last) = self.last_request.get() {
+                if let Some(delay) = Duration::from_millis(650).checked_sub(last.elapsed()) {
+                    std::thread::sleep(delay);
+                }
+            }
             request = request.timeout(Duration::from_secs(8));
         }
         if let Some(body) = body {
             request = request.json(body);
         }
+        self.last_request.set(Some(std::time::Instant::now()));
         let response = request
             .send()
             .context("ClickUp request failed; check connectivity (writes may have succeeded)")?;
@@ -1021,6 +1061,26 @@ fn sync(store: &Store, api: &Api, link: &Link, resolve: Option<(i64, Choice)>) -
     // Tombstones remain mapped: deleting locally must not resurrect tasks on pull.
     let seen_remote: HashSet<String> = known.iter().filter_map(|m| m.remote_id.clone()).collect();
     for mapping in known {
+        if !mapping.pending && resolve.is_none_or(|(id, _)| mapping.local_id != Some(id)) {
+            if let (Some(id), Some(remote_id), Some(old_local), Some(old_remote)) = (
+                mapping.local_id,
+                &mapping.remote_id,
+                &mapping.local_base,
+                &mapping.remote_base,
+            ) {
+                if let Some(remote) = remote_tasks.iter().find(|r| &r.id == remote_id) {
+                    if store.task(id).is_ok_and(|task| {
+                        task.project_id == Some(link.project_id) && State::from(&task) == *old_local
+                    }) && remote
+                        .snapshot(link)
+                        .is_ok_and(|snapshot| snapshot == *old_remote)
+                    {
+                        report.unchanged += 1;
+                        continue;
+                    }
+                }
+            }
+        }
         let result = sync_one(store, api, link, &mapping, resolve, &mut report);
         if let Err(error) = result {
             report.issues.push(Issue {
@@ -1200,11 +1260,64 @@ pub fn auto_enabled(store: &Store) -> Result<bool> {
     )?)
 }
 
-fn auto_cycle_with_api(store: &Store, api: &Api, discover_new: bool) -> Result<AutoReport> {
+fn push_pending(store: &Store, api: &Api) -> Result<AutoReport> {
     let mut result = AutoReport::default();
+    let links = links(store)?;
+    result.projects = links.len();
+    let known: HashMap<_, _> = links
+        .iter()
+        .map(|link| Ok((link.project_id, mappings(store, link.project_id)?)))
+        .collect::<Result<_>>()?;
+    let mut tasks = store.tasks(Scope::All, Status::All, "")?;
+    tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    for task in tasks {
+        let Some(link) = links.iter().find(|l| Some(l.project_id) == task.project_id) else {
+            continue;
+        };
+        let mapping = known[&link.project_id]
+            .iter()
+            .find(|m| m.local_id == Some(task.id));
+        let mut report = Report::default();
+        let outcome = if let Some(mapping) = mapping {
+            if mapping.local_base.as_ref() == Some(&State::from(&task)) {
+                continue;
+            }
+            sync_one(store, api, link, mapping, None, &mut report)
+        } else {
+            if known
+                .values()
+                .flatten()
+                .any(|m| m.local_id == Some(task.id))
+            {
+                continue;
+            }
+            create_remote(store, api, link, task.id).map(|()| {
+                report.created += 1;
+            })
+        };
+        result.changed += report.created + report.pushed + report.pulled;
+        if let Err(error) = outcome {
+            result.issues.push(format!(
+                "Project {} task {}: {error:#}",
+                link.project_id, task.id
+            ));
+        }
+        if api.rate_limited.get() {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+fn auto_cycle_with_api(store: &Store, api: &Api, discover_new: bool) -> Result<AutoReport> {
     if !auto_enabled(store)? {
+        return Ok(AutoReport::default());
+    }
+    let mut result = push_pending(store, api)?;
+    if !discover_new || api.rate_limited.get() {
         return Ok(result);
     }
+    result.projects = 0;
     let all_lists: bool = store.conn.query_row(
         "SELECT all_lists FROM clickup_preferences WHERE id=1",
         [],
@@ -1263,6 +1376,7 @@ fn auto_cycle(
     database: &Path,
     discover_new: bool,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<AutoReport> {
     let store = Store::open(database)?;
     if !auto_enabled(&store)? {
@@ -1283,17 +1397,19 @@ fn auto_cycle(
         .context("Another ClickUp operation is running; will retry")?;
     let mut api = Api::new(&secret)?;
     api.cancel = cancel;
+    api.interrupt = interrupt;
     auto_cycle_with_api(&store, &api, discover_new)
 }
 
 pub fn push_after_edit(database: &Path) -> Result<AutoReport> {
-    auto_cycle(database, false, None)
+    auto_cycle(database, false, None, None)
 }
 
 pub struct AutoSync {
     requests: Option<std::sync::mpsc::Sender<bool>>,
     pub results: std::sync::mpsc::Receiver<Result<AutoReport>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1303,6 +1419,8 @@ impl AutoSync {
         let (send, results) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = cancel.clone();
+        let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pause = interrupt.clone();
         let path = database.to_path_buf();
         let thread = std::thread::spawn(move || {
             while let Ok(mut discover) = receive.recv() {
@@ -1314,7 +1432,13 @@ impl AutoSync {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let result = auto_cycle(&path, discover, Some(stop.clone()));
+                pause.store(false, std::sync::atomic::Ordering::Relaxed);
+                let result = auto_cycle(
+                    &path,
+                    discover,
+                    Some(stop.clone()),
+                    discover.then(|| pause.clone()),
+                );
                 if send.send(result).is_err() {
                     break;
                 }
@@ -1324,6 +1448,7 @@ impl AutoSync {
             requests: Some(requests),
             results,
             cancel,
+            interrupt,
             thread: Some(thread),
         };
         worker.request(true);
@@ -1331,20 +1456,28 @@ impl AutoSync {
     }
 
     pub fn request(&self, discovery: bool) {
+        if !discovery {
+            self.interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(sender) = &self.requests {
             let _ = sender.send(discovery);
         }
     }
-}
 
-impl Drop for AutoSync {
-    fn drop(&mut self) {
+    pub fn stop(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.requests.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for AutoSync {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1383,7 +1516,12 @@ fn sync_one(
             .as_ref()
             .context("Missing remote sync baseline")?;
         let local_changed = &state != old_local;
-        let remote_changed = &remote != old_remote;
+        let remote_changed = remote.state != old_remote.state
+            || remote.status != old_remote.status
+            || remote.due_date != old_remote.due_date
+            || remote.due_date_time != old_remote.due_date_time
+            || remote.start_date != old_remote.start_date
+            || remote.start_date_time != old_remote.start_date_time;
         let choice = resolve
             .filter(|(task, _)| *task == id)
             .map(|(_, choice)| choice);
@@ -1393,8 +1531,9 @@ fn sync_one(
         let push = matches!(choice, Some(Choice::Local))
             || (choice.is_none() && local_changed && !remote_changed);
         let pull = matches!(choice, Some(Choice::Remote))
-            || (choice.is_none() && remote_changed && !local_changed);
+            || (choice.is_none() && &remote != old_remote && !local_changed);
         if push {
+            let _writing = api.protect_write();
             // ClickUp has no conditional update/ETag API. Check again immediately
             // before writing; a remote edit during the request is still possible.
             if api.remote(remote_id)?.snapshot(link)? != remote {
@@ -1433,6 +1572,7 @@ fn sync_one(
 }
 
 fn create_remote(store: &Store, api: &Api, link: &Link, id: i64) -> Result<()> {
+    let _writing = api.protect_write();
     let (task, mapping) = atomic(store, || {
         let task = store.task(id)?;
         if task.project_id != Some(link.project_id) {
@@ -1853,6 +1993,7 @@ mod tests {
         pages: usize,
         before_task_read: Option<Box<dyn FnOnce() + Send>>,
         skip_task_reads: usize,
+        task_reads: usize,
     }
 
     impl Backend {
@@ -1909,6 +2050,7 @@ mod tests {
             }
             if let Some(id) = route.strip_prefix("/task/") {
                 if method == "GET" {
+                    self.task_reads += 1;
                     if self.skip_task_reads > 0 {
                         self.skip_task_reads -= 1;
                     } else if let Some(edit) = self.before_task_read.take() {
@@ -2670,7 +2812,7 @@ mod tests {
         );
         mock.state.lock().unwrap().tasks.get_mut("r1").unwrap()["name"] = json!("Automatic pull");
         assert_eq!(
-            auto_cycle_with_api(&store, &mock.api, false)
+            auto_cycle_with_api(&store, &mock.api, true)
                 .unwrap()
                 .changed,
             1
@@ -2763,6 +2905,91 @@ mod tests {
             mock.state.lock().unwrap().tasks["r1"]["markdown_description"],
             "Later local edit"
         );
+    }
+
+    #[test]
+    fn pending_reopen_and_assignment_skip_full_scans_and_preserve_rapid_status_changes() {
+        let (dir, store, link) = setup();
+        let mock = Mock::new(vec![remote("r1", "Test")]);
+        sync(&store, &mock.api, &link, None).unwrap();
+        let task = store.tasks(Scope::All, Status::All, "").unwrap().remove(0);
+        store.set_done(task.id, true).unwrap();
+        let path = dir.path().join("tasks.sqlite3");
+        mock.state.lock().unwrap().skip_task_reads = 1;
+        mock.state.lock().unwrap().before_task_read = Some(Box::new(move || {
+            Store::open(&path)
+                .unwrap()
+                .set_done(task.id, false)
+                .unwrap();
+        }));
+        let pages = mock.state.lock().unwrap().pages;
+        assert_eq!(
+            auto_cycle_with_api(&store, &mock.api, false)
+                .unwrap()
+                .changed,
+            1
+        );
+        assert_eq!(
+            mock.state.lock().unwrap().tasks["r1"]["status"]["status"],
+            "closed"
+        );
+        assert!(!store.task(task.id).unwrap().done);
+        // Server-maintained close metadata can settle after the initial response.
+        mock.state.lock().unwrap().tasks.get_mut("r1").unwrap()["date_closed"] =
+            json!(1793260000000_i64.to_string());
+        store.assign(task.id, &[7]).unwrap();
+        let reopened = auto_cycle_with_api(&store, &mock.api, false).unwrap();
+        assert!(reopened.issues.is_empty(), "{:?}", reopened.issues);
+        assert_eq!(reopened.changed, 1);
+        let backend = mock.state.lock().unwrap();
+        assert_eq!(backend.pages, pages);
+        assert_eq!(backend.tasks["r1"]["status"]["status"], "to do");
+        assert_eq!(backend.tasks["r1"]["assignees"][0]["id"], 7);
+        drop(backend);
+        assert!(store.task(task.id).unwrap().completed_at.is_none());
+        let reads = mock.state.lock().unwrap().task_reads;
+        sync(&store, &mock.api, &link, None).unwrap();
+        assert_eq!(mock.state.lock().unwrap().task_reads, reads);
+    }
+
+    #[test]
+    fn stopping_background_sync_releases_lock_before_manual_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clickup.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(contender.try_lock_exclusive().is_err());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let thread = thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            drop(lock);
+        });
+        let (requests, _) = std::sync::mpsc::channel();
+        let (_, results) = std::sync::mpsc::channel();
+        let mut worker = AutoSync {
+            requests: Some(requests),
+            results,
+            cancel,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            thread: Some(thread),
+        };
+        worker.stop();
+        contender.try_lock_exclusive().unwrap();
+        worker.stop();
     }
 
     #[test]

@@ -40,9 +40,10 @@ pub struct ClickupProject {
     pub workspace: String,
     pub space: String,
     pub list_name: String,
+    pub folder: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Task {
     pub id: i64,
     pub title: String,
@@ -322,7 +323,7 @@ impl Store {
     pub fn delete_project(&mut self, id: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE tasks SET project_id = NULL,
+            "UPDATE tasks SET project_id = NULL, priority_extra = NULL, assignees = '[]',
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE project_id = ?1",
             [id],
         )?;
@@ -357,13 +358,14 @@ impl Store {
     pub fn clickup_projects(&self) -> Result<Vec<ClickupProject>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT project_id,workspace,space,list_name FROM clickup_projects")?;
+            .prepare("SELECT project_id,workspace,space,list_name,folder FROM clickup_projects")?;
         let rows = stmt.query_map([], |r| {
             Ok(ClickupProject {
                 project_id: r.get(0)?,
                 workspace: r.get(1)?,
                 space: r.get(2)?,
                 list_name: r.get(3)?,
+                folder: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -442,9 +444,7 @@ impl Store {
     pub fn edit_task(&self, id: i64, edit: TaskEdit) -> Result<Task> {
         let current = self.task(id)?;
         let destination = edit.project.unwrap_or(current.project_id);
-        if let Some(priority) = edit.priority {
-            self.check_priority(destination, priority)?;
-        }
+        self.check_priority(destination, edit.priority.unwrap_or(current.priority))?;
         if edit.assignees.is_some() && !self.is_clickup_project(destination)? {
             bail!("Assignees can only be changed in ClickUp projects");
         }
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn clickup_only_fields_are_rejected_for_local_tasks_and_unknown_members() {
-        let (_dir, store) = store();
+        let (_dir, mut store) = store();
         assert!(store
             .add_task("Local urgent", "", None, Priority::Urgent, None)
             .is_err());
@@ -837,6 +837,36 @@ mod tests {
             )
             .is_err());
         assert!(store.task(task.id).unwrap().assignees.is_empty());
+        store
+            .edit_task(
+                task.id,
+                TaskEdit {
+                    priority: Some(Priority::Urgent),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(store
+            .edit_task(
+                task.id,
+                TaskEdit {
+                    project: Some(None),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET assignees='[{\"id\":7,\"username\":\"Sam\"}]' WHERE id=?1",
+                [task.id],
+            )
+            .unwrap();
+        store.delete_project(project.id).unwrap();
+        let personal = store.task(task.id).unwrap();
+        assert_eq!(personal.priority, Priority::High);
+        assert!(!personal.clickup_project);
+        assert!(personal.assignees.is_empty());
     }
 
     #[test]

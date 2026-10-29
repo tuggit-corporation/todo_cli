@@ -19,6 +19,24 @@ machine-readable API. Works on Linux and macOS, including Apple Silicon.
 Local planning needs no account, background service, or internet connection.
 The optional ClickUp integration requires your ClickUp account and network access.
 
+## Install from GitHub
+
+Download and install the latest release on macOS or Linux (Intel/ARM64):
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/tuggit-corporation/todo_cli/main/install.sh | sh
+```
+
+The script downloads the matching GitHub Release binary, verifies its SHA-256
+checksum, and installs it to `~/.local/bin/todo` without sudo. It requires `curl`,
+`tar`, and `sha256sum` or `shasum`. Alternatively, download the script to a file
+and inspect it before running. Set `TODO_INSTALL_DIR` to choose another installation directory.
+Ensure `~/.local/bin` is on your `PATH`, then run `todo`.
+
+**No release has been published yet.** This command becomes available after
+`install.sh` is pushed to `main` and the first versioned GitHub Release is
+published. Until then, install from source below.
+
 ## Install from source
 
 Install the current stable Rust toolchain, then from this directory:
@@ -63,6 +81,8 @@ subject to Homebrew's acceptance requirements.
 The sidebar contains **All tasks**, **Personal**, and your projects. Select a
 project before adding a task to assign it automatically. Adding from All tasks
 or Personal creates an unassigned task. Empty lists are normal on first launch.
+ClickUp projects show their Folder grouping (or Space when folderless), rather
+than repeating generic names such as `List`. Distinct List names follow the group.
 The focused panel has a thick cyan border, an `[ACTIVE]` title, and a cyan
 selection; the other panel stays muted. Use `h`/`l` or `Tab` to switch focus.
 
@@ -196,6 +216,9 @@ personal projects and tasks are never uploaded.
 
 Tasks save locally first. Offline edits remain stored and retry on the next
 cycle or launch. Sync issues appear in the footer; press **`I`** for details.
+Pending edits take priority over background discovery, and unchanged tasks
+do not require individual API reads. Large workspaces can take longer than one
+refresh interval because requests are paced to avoid ClickUp rate limits.
 Conflicting edits are never silently overwritten. A form opened before a
 background update must be reopened before saving.
 
@@ -320,6 +343,11 @@ todo --json clickup sync 1
 ```
 
 Sync reports imports, remote creations, pulls, pushes, and unresolved issues.
+Manual TUI operations pause background sync and wait for any in-flight write
+before taking the database sync lock; background sync resumes on returning.
+If another `todo` process is syncing the same database, let it finish before
+retrying. The lock file can remain on disk normally; do not delete it to bypass
+a running sync.
 JSON mode writes the report to stdout; issues also cause a nonzero exit code.
 Successful earlier tasks remain synced if a later task fails; retrying does
 not recreate successfully mapped tasks.

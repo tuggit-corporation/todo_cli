@@ -32,7 +32,7 @@ struct Form {
     project: usize,
     priority: Priority,
     active: usize,
-    original_updated_at: Option<String>,
+    original_task: Option<Box<Task>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -220,7 +220,7 @@ impl App {
                 Priority::Normal
             },
             active: 0,
-            original_updated_at: None,
+            original_task: None,
         };
         if edit {
             if project_form {
@@ -244,7 +244,7 @@ impl App {
                     task.deadline.clone().unwrap_or_default(),
                     task.start_date.clone().unwrap_or_default(),
                 ];
-                form.original_updated_at = Some(task.updated_at.clone());
+                form.original_task = Some(Box::new(task.clone()));
                 form.priority = task.priority;
                 form.project = task
                     .project_id
@@ -256,14 +256,6 @@ impl App {
     }
 
     fn save_form(&mut self, form: &Form, store: &Store) -> Result<()> {
-        if !form.project_form {
-            if let Some(id) = form.id {
-                if form.original_updated_at.as_deref() != Some(store.task(id)?.updated_at.as_str())
-                {
-                    anyhow::bail!("Task changed during editing. Esc and reopen it to avoid overwriting newer changes");
-                }
-            }
-        }
         if form.project_form {
             if let Some(id) = form.id {
                 store.rename_project(id, &form.fields[0])?;
@@ -288,6 +280,13 @@ impl App {
                 .and_then(|i| self.projects.get(i))
                 .map(|p| p.id);
             if let Some(id) = form.id {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &store.conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                if form.original_task.as_deref() != Some(&store.task(id)?) {
+                    anyhow::bail!("Task changed during editing. Esc and reopen it to avoid overwriting newer changes");
+                }
                 store.edit_task(
                     id,
                     TaskEdit {
@@ -302,6 +301,7 @@ impl App {
                         ..TaskEdit::default()
                     },
                 )?;
+                tx.commit()?;
             } else {
                 store.conn.execute_batch("BEGIN IMMEDIATE")?;
                 let result = (|| -> Result<_> {
@@ -408,6 +408,10 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
+                        let tx = rusqlite::Transaction::new_unchecked(
+                            &store.conn,
+                            rusqlite::TransactionBehavior::Immediate,
+                        )?;
                         let current = store.task(task)?;
                         if current.assignees != original {
                             self.message =
@@ -433,6 +437,7 @@ impl App {
                                     ..Default::default()
                                 },
                             )?;
+                            tx.commit()?;
                             self.refresh(store)?;
                             self.message = "Assignees saved; ClickUp sync queued.".into();
                             close = true;
@@ -754,14 +759,19 @@ impl App {
         let mut project_items = vec![ListItem::new("All tasks"), ListItem::new("Personal")];
         project_items.extend(self.projects.iter().map(|p| {
             if let Some(link) = self.clickup_projects.iter().find(|c| c.project_id == p.id) {
-                ListItem::new(format!(
-                    "[CU] {}",
-                    crate::safe(if link.list_name.is_empty() {
-                        &p.name
-                    } else {
-                        &link.list_name
-                    })
-                ))
+                let group = link
+                    .folder
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&link.space);
+                let label = if group.is_empty() {
+                    p.name.clone()
+                } else if link.list_name.is_empty() || link.list_name.eq_ignore_ascii_case("list") {
+                    group.to_owned()
+                } else {
+                    format!("{group} / {}", link.list_name)
+                };
+                ListItem::new(format!("[CU] {}", crate::safe(&label)))
             } else {
                 ListItem::new(crate::safe(&p.name))
             }
@@ -1198,7 +1208,7 @@ pub fn run(store: &mut Store, database: &std::path::Path) -> Result<()> {
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
     let mut last_refresh = Instant::now();
-    let auto_sync = crate::clickup::AutoSync::start(database);
+    let mut auto_sync = crate::clickup::AutoSync::start(database);
     let mut last_sync = Instant::now();
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -1223,6 +1233,10 @@ pub fn run(store: &mut Store, database: &std::path::Path) -> Result<()> {
                     };
                     disable_raw_mode()?;
                     execute!(io::stdout(), LeaveAlternateScreen)?;
+                    eprintln!(
+                        "Pausing background sync; waiting for any in-flight write to finish..."
+                    );
+                    auto_sync.stop();
                     let result = crate::clickup::run(command, database, false);
                     if let Err(error) = &result {
                         eprintln!("ClickUp: {error:#}");
@@ -1233,6 +1247,8 @@ pub fn run(store: &mut Store, database: &std::path::Path) -> Result<()> {
                     enable_raw_mode()?;
                     execute!(io::stdout(), EnterAlternateScreen)?;
                     terminal.clear()?;
+                    auto_sync = crate::clickup::AutoSync::start(database);
+                    last_sync = Instant::now();
                     app.refresh(store)?;
                     app.message = if result.is_ok() {
                         "ClickUp operation finished."
@@ -1424,6 +1440,7 @@ mod tests {
             .unwrap();
         let project = store.add_project("Remote").unwrap();
         store.conn.execute("INSERT INTO clickup_projects(project_id,list_id,open_status,working_status,done_status,timezone,workspace,space,members) VALUES (?1,'123','to do','in progress','closed','UTC','Work','Engineering','[{\"id\":7,\"username\":\"Sam\"}]')", [project.id]).unwrap();
+        store.conn.execute("UPDATE clickup_projects SET folder='Migration group',list_name='List' WHERE project_id=?1", [project.id]).unwrap();
         let remote = store
             .add_task("Remote", "", Some(project.id), Priority::Urgent, None)
             .unwrap();
@@ -1468,6 +1485,7 @@ mod tests {
         assert!(screen.contains("Work / Engineering"));
         assert!(screen.contains("Assignees: Sam"));
         assert!(screen.contains("urgent"));
+        assert!(screen.contains("[CU] Migration group"));
     }
 
     #[test]
@@ -1486,6 +1504,13 @@ mod tests {
                     notes: Some("Background update".into()),
                     ..Default::default()
                 },
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET updated_at=?1 WHERE id=?2",
+                rusqlite::params![task.updated_at, task.id],
             )
             .unwrap();
         app.key(
